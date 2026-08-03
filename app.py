@@ -4,7 +4,6 @@ from datetime import date, timedelta
 import io
 import math
 import warnings
-import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -12,10 +11,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
-import shap
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LassoCV
 from sklearn.preprocessing import StandardScaler
+from sklearn.inspection import permutation_importance
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 from scipy.optimize import minimize
 
@@ -378,7 +377,7 @@ with tabs[3]:
 with tabs[4]:
     st.markdown("#### Dynamic Scoring Engine")
     
-    use_ml = st.toggle("🤖 Auto-Apply Machine-Learned Weights", value=False, help="If enabled, sliders are overridden by the SHAP values generated in the ML tab.")
+    use_ml = st.toggle("🤖 Auto-Apply Machine-Learned Weights", value=False, help="If enabled, sliders are overridden by the ML model generated in the ML tab.")
     
     if use_ml and 'ml_weights' in st.session_state:
         ml_w = st.session_state['ml_weights']
@@ -388,7 +387,7 @@ with tabs[4]:
         w_debt = ml_w.get("Debt / Equity", 0.2)
         w_val = 0.1 
         
-        st.info("Weights are currently being driven by the SHAP values from the ML model.")
+        st.info("Weights are currently being driven by the ML model.")
         col1, col2, col3, col4, col5 = st.columns(5)
         col1.metric("Growth Weight", f"{w_ret:.0%}")
         col2.metric("Risk Weight", f"{w_risk:.0%}")
@@ -436,11 +435,11 @@ with tabs[4]:
     st.dataframe(score.style.format("{:.1f}"),use_container_width=True)
 
 # -----------------------------------------
-# TAB 5: ML FACTOR DISCOVERY (SHAP & STATISTICS)
+# TAB 5: ML FACTOR DISCOVERY (STATISTICAL & TREE-BASED)
 # -----------------------------------------
 with tabs[5]:
     st.markdown("#### 🧠 Quantitative Factor Discovery")
-    st.markdown("This engine discovers which financial metrics actually drive forward returns, checks for multicollinearity, and explains the model's logic using SHAP values.")
+    st.markdown("This engine discovers which financial metrics actually drive forward returns, checks for multicollinearity, and extracts directional impact using ML.")
     
     @st.cache_data(ttl=3600, show_spinner=True)
     def build_ml_dataset(selected_stocks, start, end):
@@ -488,45 +487,48 @@ with tabs[5]:
                 vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(len(X.columns))]
                 st.dataframe(vif_data.style.format({"VIF": "{:.2f}"}), use_container_width=True)
 
-            if st.button("Run Full ML Pipeline & SHAP Analysis"):
-                with st.spinner("Training Random Forest & Extracting SHAP Values..."):
+            if st.button("Run Full ML Pipeline"):
+                with st.spinner("Training Models & Extracting Importance..."):
+                    # 1. Lasso Regression
                     scaler = StandardScaler()
                     X_scaled = scaler.fit_transform(X)
                     lasso = LassoCV(cv=3, random_state=42).fit(X_scaled, y)
                     lasso_imp = pd.DataFrame({"Feature": features, "Lasso_Coefficient": lasso.coef_}).sort_values("Lasso_Coefficient", ascending=False)
                     
+                    # 2. Random Forest + Permutation Importance
                     rf = RandomForestRegressor(n_estimators=200, max_depth=4, random_state=42)
                     rf.fit(X, y)
+                    perm = permutation_importance(rf, X, y, n_repeats=10, random_state=42)
                     
-                    explainer = shap.TreeExplainer(rf)
-                    shap_values = explainer.shap_values(X)
+                    # Calculate directional correlation (proxy for SHAP colors)
+                    correlations = X.corrwith(y)
                     
-                    shap_abs_mean = np.abs(shap_values).mean(0)
-                    total_shap = shap_abs_mean.sum()
-                    ml_weights = {features[i]: (shap_abs_mean[i] / total_shap) for i in range(len(features))}
+                    imp_df = pd.DataFrame({
+                        "Feature": features, 
+                        "Importance": perm.importances_mean,
+                        "Direction": correlations.values
+                    })
+                    imp_df["Direction Color"] = imp_df["Direction"].apply(lambda x: "Positive" if x > 0 else "Negative")
+                    
+                    # Save ML weights to session state
+                    total_imp = imp_df["Importance"].sum()
+                    ml_weights = {features[i]: (imp_df["Importance"].iloc[i] / total_imp) for i in range(len(features))}
                     st.session_state['ml_weights'] = ml_weights
 
+                    # Plotting
                     col1, col2 = st.columns(2)
                     with col1:
                         st.markdown("##### Lasso Regression (Linear Drivers)")
-                        fig1 = px.bar(lasso_imp, x="Lasso_Coefficient", y="Feature", orientation='h', title="Linear Impact on Forward Returns")
+                        fig1 = px.bar(lasso_imp.sort_values("Lasso_Coefficient"), x="Lasso_Coefficient", y="Feature", orientation='h', title="Linear Impact on Forward Returns")
                         fig1.update_layout(plot_bgcolor='#0D1117', paper_bgcolor='#0D1117', font=dict(color='#E6EDF3'))
                         st.plotly_chart(fig1, use_container_width=True)
                         
                     with col2:
                         st.markdown("##### Random Forest Importance (Non-Linear)")
-                        imp_df = pd.DataFrame({"Feature": features, "Importance": rf.feature_importances_}).sort_values("Importance", ascending=True)
-                        fig2 = px.bar(imp_df, x="Importance", y="Feature", orientation='h', title="Tree-Based Feature Importance")
+                        fig2 = px.bar(imp_df.sort_values("Importance"), x="Importance", y="Feature", orientation='h', color="Direction Color", color_discrete_map={"Positive": "#3FB950", "Negative": "#F85149"}, title="What Drives Returns (Green=Pos, Red=Neg)")
                         fig2.update_layout(plot_bgcolor='#0D1117', paper_bgcolor='#0D1117', font=dict(color='#E6EDF3'))
                         st.plotly_chart(fig2, use_container_width=True)
 
-                    st.markdown("##### SHAP Summary Plot (Directional Impact)")
-                    st.markdown("Red means high feature value, Blue means low. Right side means positive impact on returns.")
-                    plt.style.use('dark_background')
-                    fig3, ax3 = plt.subplots(figsize=(10, 6))
-                    shap.summary_plot(shap_values, X, feature_names=features, plot_type="dot", show=False, color_bar=False)
-                    st.pyplot(fig3, bbox_inches='tight')
-                    
                     st.success("✅ ML Weights generated! Go to the 'Scoring Engine' tab to apply them automatically.")
 
 # -----------------------------------------

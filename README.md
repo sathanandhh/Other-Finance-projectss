@@ -1,6 +1,3 @@
-# India Power Stocks — Five-Year Analytics
-
-A classroom-ready Streamlit dashboard for NTPC, Power Grid, Tata Power, Adani Power and JSW Energy.
 
 ## Features
 

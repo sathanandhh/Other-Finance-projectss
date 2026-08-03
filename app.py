@@ -4,6 +4,7 @@ from datetime import date, timedelta
 import io
 import math
 import warnings
+import matplotlib.pyplot as plt
 
 import numpy as np
 import pandas as pd
@@ -11,8 +12,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+import shap
 from sklearn.ensemble import RandomForestRegressor
-from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LassoCV
+from sklearn.preprocessing import StandardScaler
+from statsmodels.stats.outliers_influence import variance_inflation_factor
 from scipy.optimize import minimize
 
 warnings.filterwarnings("ignore")
@@ -31,7 +35,7 @@ RISK_FREE_RATE = 0.065
 DEFAULT_TICKERS = "NTPC.NS, POWERGRID.NS, TATAPOWER.NS, ADANIPOWER.NS, JSWENERGY.NS, TORNTPOWER.NS, NHPC.NS, CESC.NS"
 
 # -----------------------------------------
-# UI / THEME STYLING (BLOOMBERG / POWER BI STYLE)
+# UI / THEME STYLING
 # -----------------------------------------
 st.markdown("""
 <style>
@@ -40,15 +44,12 @@ st.markdown("""
 html, body, [class*="css"] {font-family: 'Inter', sans-serif; color: #E6EDF3;}
 .stApp {background: #0D1117; background-image: radial-gradient(circle at 50% 0%, #161B22 0%, #0D1117 70%);}
 
-/* Headers */
 h1, h2, h3 {color: #FFFFFF; font-weight: 700; border-bottom: 1px solid #30363D; padding-bottom: 10px; margin-top: 0px;}
 
-/* Sidebar */
 [data-testid="stSidebar"] {background: #161B22; border-right: 1px solid #30363D;}
 [data-testid="stSidebar"] * {color: #C9D1D9 !important;}
 [data-testid="stSidebar"] h2 {color: #58A6FF !important; border-bottom: 1px solid #30363D;}
 
-/* Metrics */
 [data-testid="stMetric"] {
     background: #161B22; border: 1px solid #30363D; padding: 15px; border-radius: 8px;
     box-shadow: 0 4px 6px rgba(0,0,0,0.3);
@@ -56,7 +57,6 @@ h1, h2, h3 {color: #FFFFFF; font-weight: 700; border-bottom: 1px solid #30363D; 
 [data-testid="stMetric"] label p {color: #8B949E !important; font-size: 0.85rem !important; font-weight: 600;}
 [data-testid="stMetric"] div {color: #FFFFFF !important; font-size: 1.5rem !important; font-weight: 700; font-family: 'JetBrains Mono', monospace;}
 
-/* Tabs */
 .stTabs [data-baseweb="tab-list"] {gap: 8px; background: transparent; border-bottom: 1px solid #30363D;}
 .stTabs button[data-baseweb="tab"] {
     background: #21262D; border-radius: 6px 6px 0 0; border: 1px solid #30363D;
@@ -70,12 +70,10 @@ h1, h2, h3 {color: #FFFFFF; font-weight: 700; border-bottom: 1px solid #30363D; 
 .stTabs [data-baseweb="tab-highlight"] {display: none !important;}
 .stTabs [data-baseweb="tab-border"] {display: none !important;}
 
-/* Dataframes */
 .stDataFrame {border: 1px solid #30363D; border-radius: 8px; overflow: hidden;}
 .stDataFrame table {background: #161B22 !important;}
 .stDataFrame thead th {background: #21262D !important; color: #58A6FF !important; font-weight: 700;}
 
-/* Buttons */
 .stButton button, .stDownloadButton button {
     background: #238636 !important; color: #FFFFFF !important; border: 1px solid #2EA043 !important;
     border-radius: 6px !important; font-weight: 600 !important; transition: all 0.2s !important;
@@ -90,17 +88,13 @@ section[data-testid="stSidebar"] div[data-testid="stButton"] button:hover {
     background: #30363D !important; border-color: #58A6FF !important; box-shadow: 0 0 8px rgba(88, 166, 255, 0.2) !important;
 }
 
-/* Inputs & Selects */
 div[data-baseweb="select"] > div {background: #21262D !important; border: 1px solid #30363D !important;}
 div[data-baseweb="select"] span {color: #C9D1D9 !important;}
 [data-baseweb="popover"] [role="listbox"] {background: #161B22 !important; border: 1px solid #30363D !important;}
 [data-baseweb="popover"] [role="option"] {color: #C9D1D9 !important;}
 [data-baseweb="popover"] [role="option"]:hover, [data-baseweb="popover"] [aria-selected="true"] {background: #21262D !important;}
 
-/* Custom Classes */
 .terminal-header {font-family: 'JetBrains Mono', monospace; color: #58A6FF; letter-spacing: 1px; text-transform: uppercase; font-size: 0.9rem; margin-bottom: 5px; font-weight: 600;}
-.metric_positive {color: #3FB950 !important;}
-.metric_negative {color: #F85149 !important;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -188,7 +182,6 @@ def annual_financials(income, balance, cashflow):
     avg_assets = out["Total Assets"].rolling(2).mean()
     avg_equity = out["Equity"].rolling(2).mean()
     
-    # Basic Ratios
     out["Net Margin"] = safe_div(out["Net Income"], out["Revenue"])
     out["EBITDA Margin"] = safe_div(out["EBITDA"], out["Revenue"])
     out["ROA"] = safe_div(out["Net Income"], avg_assets)
@@ -199,7 +192,6 @@ def annual_financials(income, balance, cashflow):
     out["Interest Coverage"] = safe_div(out["EBIT"], out["Interest Expense"])
     out["Asset Turnover"] = safe_div(out["Revenue"], avg_assets)
     
-    # Advanced Feature Engineering
     out["ROCE"] = safe_div(out["EBIT"], avg_assets - out["Current Liabilities"])
     out["Debt / EBITDA"] = safe_div(out["Debt"], out["EBITDA"])
     out["FCF Margin"] = safe_div(out["Free Cash Flow"], out["Revenue"])
@@ -245,7 +237,6 @@ with st.sidebar:
     tickers_str = st.text_area("Enter Yahoo Finance Tickers (comma-separated)", DEFAULT_TICKERS)
     tickers = [t.strip() for t in tickers_str.split(",") if t.strip()]
     
-    # Create dictionaries dynamically
     STOCKS = {t.split('.')[0]: t for t in tickers}
     COLORS = {name: px.colors.qualitative.Plotly[i % len(px.colors.qualitative.Plotly)] for i, name in enumerate(STOCKS.keys())}
 
@@ -381,7 +372,6 @@ with tabs[3]:
     fig.update_xaxes(gridcolor='#30363D'); fig.update_yaxes(gridcolor='#30363D')
     st.plotly_chart(fig,use_container_width=True)
 
-
 # -----------------------------------------
 # TAB 4: SCORING ENGINE (DYNAMIC ML WEIGHTS)
 # -----------------------------------------
@@ -393,10 +383,10 @@ with tabs[4]:
     if use_ml and 'ml_weights' in st.session_state:
         ml_w = st.session_state['ml_weights']
         w_ret = ml_w.get("Revenue Growth (YoY)", 0.2)
-        w_risk = 0.15 # Risk is usually fixed, or mapped inversely
+        w_risk = 0.15 
         w_roe = ml_w.get("ROE", 0.2)
         w_debt = ml_w.get("Debt / Equity", 0.2)
-        w_val = 0.1 # Valuation needs to be added to features later
+        w_val = 0.1 
         
         st.info("Weights are currently being driven by the SHAP values from the ML model.")
         col1, col2, col3, col4, col5 = st.columns(5)
@@ -444,12 +434,13 @@ with tabs[4]:
     fig.update_xaxes(gridcolor='#30363D'); fig.update_yaxes(gridcolor='#30363D')
     st.plotly_chart(fig,use_container_width=True)
     st.dataframe(score.style.format("{:.1f}"),use_container_width=True)
+
 # -----------------------------------------
-# TAB 5: ML FACTOR DISCOVERY
+# TAB 5: ML FACTOR DISCOVERY (SHAP & STATISTICS)
 # -----------------------------------------
 with tabs[5]:
-    st.markdown("#### 🧠 ML Factor Discovery & Weight Optimizer")
-    st.markdown("This engine aggregates historical financials, calculates 1-Year Forward Returns, and uses a Random Forest model to identify which financial metrics actually drive stock performance.")
+    st.markdown("#### 🧠 Quantitative Factor Discovery")
+    st.markdown("This engine discovers which financial metrics actually drive forward returns, checks for multicollinearity, and explains the model's logic using SHAP values.")
     
     @st.cache_data(ttl=3600, show_spinner=True)
     def build_ml_dataset(selected_stocks, start, end):
@@ -476,13 +467,13 @@ with tabs[5]:
         return pd.DataFrame(records)
 
     if len(selected) < 4:
-        st.warning("Please select at least 4-5 companies to run the ML Factor Discovery model effectively.")
+        st.warning("Select at least 4-5 companies to run the ML engine.")
     else:
         ml_df = build_ml_dataset(tuple(selected), start.isoformat(), end.isoformat())
-        if ml_df.empty or len(ml_df) < 10:
-            st.warning("Not enough historical overlap between financials and prices to train the model. Try selecting more companies.")
+        if ml_df.empty or len(ml_df) < 15:
+            st.warning("Not enough historical data. Try selecting more companies.")
         else:
-            st.success(f"Dataset built: {len(ml_df)} company-year observations.")
+            st.success(f"Dataset built: {len(ml_df)} observations.")
             
             features = ["ROE", "ROCE", "Debt / Equity", "Debt / EBITDA", "Net Margin", "FCF Margin", "Revenue Growth (YoY)", "EBITDA Growth (YoY)", "Interest Coverage", "Current Ratio"]
             ml_df = ml_df.dropna(subset=["Forward_Return"])
@@ -490,23 +481,53 @@ with tabs[5]:
             X = ml_df[features].fillna(0)
             y = ml_df["Forward_Return"]
             
-            if st.button("Train Random Forest & Extract Weights"):
-                with st.spinner("Training ML Model..."):
-                    rf = RandomForestRegressor(n_estimators=100, random_state=42)
+            with st.expander("Stage 1: Statistical Diagnostics (VIF)"):
+                st.markdown("Variance Inflation Factor (VIF) removes redundant features. A VIF > 5 indicates high multicollinearity.")
+                vif_data = pd.DataFrame()
+                vif_data["Feature"] = X.columns
+                vif_data["VIF"] = [variance_inflation_factor(X.values, i) for i in range(len(X.columns))]
+                st.dataframe(vif_data.style.format({"VIF": "{:.2f}"}), use_container_width=True)
+
+            if st.button("Run Full ML Pipeline & SHAP Analysis"):
+                with st.spinner("Training Random Forest & Extracting SHAP Values..."):
+                    scaler = StandardScaler()
+                    X_scaled = scaler.fit_transform(X)
+                    lasso = LassoCV(cv=3, random_state=42).fit(X_scaled, y)
+                    lasso_imp = pd.DataFrame({"Feature": features, "Lasso_Coefficient": lasso.coef_}).sort_values("Lasso_Coefficient", ascending=False)
+                    
+                    rf = RandomForestRegressor(n_estimators=200, max_depth=4, random_state=42)
                     rf.fit(X, y)
                     
-                    importances = rf.feature_importances_
-                    imp_df = pd.DataFrame({"Feature": features, "Importance": importances})
-                    imp_df = imp_df.sort_values("Importance", ascending=False)
+                    explainer = shap.TreeExplainer(rf)
+                    shap_values = explainer.shap_values(X)
                     
-                    st.subheader("Machine-Learned Feature Importances")
-                    st.markdown("These are the factors that historically drove forward 1-year returns in your selected pool.")
-                    fig = px.bar(imp_df, x="Importance", y="Feature", orientation='h', title="What Actually Drives Returns?")
-                    fig.update_layout(plot_bgcolor='#0D1117', paper_bgcolor='#0D1117', font=dict(color='#E6EDF3'))
-                    fig.update_xaxes(gridcolor='#30363D'); fig.update_yaxes(gridcolor='#30363D')
-                    st.plotly_chart(fig, use_container_width=True)
+                    shap_abs_mean = np.abs(shap_values).mean(0)
+                    total_shap = shap_abs_mean.sum()
+                    ml_weights = {features[i]: (shap_abs_mean[i] / total_shap) for i in range(len(features))}
+                    st.session_state['ml_weights'] = ml_weights
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.markdown("##### Lasso Regression (Linear Drivers)")
+                        fig1 = px.bar(lasso_imp, x="Lasso_Coefficient", y="Feature", orientation='h', title="Linear Impact on Forward Returns")
+                        fig1.update_layout(plot_bgcolor='#0D1117', paper_bgcolor='#0D1117', font=dict(color='#E6EDF3'))
+                        st.plotly_chart(fig1, use_container_width=True)
+                        
+                    with col2:
+                        st.markdown("##### Random Forest Importance (Non-Linear)")
+                        imp_df = pd.DataFrame({"Feature": features, "Importance": rf.feature_importances_}).sort_values("Importance", ascending=True)
+                        fig2 = px.bar(imp_df, x="Importance", y="Feature", orientation='h', title="Tree-Based Feature Importance")
+                        fig2.update_layout(plot_bgcolor='#0D1117', paper_bgcolor='#0D1117', font=dict(color='#E6EDF3'))
+                        st.plotly_chart(fig2, use_container_width=True)
+
+                    st.markdown("##### SHAP Summary Plot (Directional Impact)")
+                    st.markdown("Red means high feature value, Blue means low. Right side means positive impact on returns.")
+                    plt.style.use('dark_background')
+                    fig3, ax3 = plt.subplots(figsize=(10, 6))
+                    shap.summary_plot(shap_values, X, feature_names=features, plot_type="dot", show=False, color_bar=False)
+                    st.pyplot(fig3, bbox_inches='tight')
                     
-                    st.info("To apply these to the Ranking tab, map the top 5 features to the sliders manually based on these proportions.")
+                    st.success("✅ ML Weights generated! Go to the 'Scoring Engine' tab to apply them automatically.")
 
 # -----------------------------------------
 # TAB 6: PORTFOLIO OPTIMIZER
